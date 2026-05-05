@@ -1,17 +1,26 @@
 # train.py
+import json
+from pathlib import Path
+from datetime import datetime
+
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 import torch.optim as optim
+import matplotlib.pyplot as plt
 
 from dataset import VesselDataset
 from model import VesselNet
 from utils import compute_loss
 
-from pathlib import Path
-from datetime import datetime
-import json
-import matplotlib.pyplot as plt
+'''
+Precision
+“How often am I right when I say vessel?”
+Recall
+“How many real vessels did I find?”
+F1
+Balance between precision and recall
+'''
 
 # =========================
 # CHOOSE FIXED MATRIX SIZE HERE
@@ -19,7 +28,9 @@ import matplotlib.pyplot as plt
 TARGET_HEIGHT = 300
 TARGET_WIDTH = 298
 
-# Other training settings
+# =========================
+# DATA SETTINGS
+# =========================
 USE_PRECOMPUTED = True
 
 TRAIN_DIR = "./data/train_data"
@@ -28,18 +39,34 @@ TEST_DIR = "./data/test_data"
 TRAIN_DEMON_DIR = "./data/train_demon_mats"
 TEST_DEMON_DIR = "./data/test_demon_mats"
 
-# BATCH_SIZE = 16
+# =========================
+# TRAINING SETTINGS
+# =========================
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
-# LEARNING_RATE = 3e-4
-# NUM_EPOCHS = 10
-# NUM_EPOCHS = 30
 NUM_EPOCHS = 20
 NUM_WORKERS = 4
-# LAMBDA_COL = 1.0
-# LAMBDA_COL = 0.5
-LAMBDA_COL = 0.1
-# LAMBDA_COL = 2.0
+
+# Column loss weight
+LAMBDA_COL = 0.15
+
+# DEMON params - only relevant if use_precomputed=False
+BLOCK_LEN = 1.0
+FPASS = 100
+FSTOP = 1500
+FPASS_DEMON = 300
+
+# Combined checkpoint score
+# presence matters most, then column_tol2.
+# F1 is better than accuracy for binary detection quality.
+COMBINED_SCORE_FORMULA = "f1 + 0.5 * column_tol2"
+
+
+def create_run_dir(base_dir="./models"):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    run_dir = Path(base_dir) / f"model_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
 
 def save_run_config(run_dir, config_dict):
@@ -48,6 +75,7 @@ def save_run_config(run_dir, config_dict):
     with open(config_path, "w") as f:
         for key, value in config_dict.items():
             f.write(f"{key}: {value}\n")
+
 
 def save_training_plots(history, run_dir):
     epochs = range(1, len(history["train_loss"]) + 1)
@@ -75,10 +103,25 @@ def save_training_plots(history, run_dir):
     plt.savefig(run_dir / "presence_accuracy.png")
     plt.close()
 
+    # Precision / Recall / F1
+    plt.figure()
+    plt.plot(epochs, history["precision"], label="precision")
+    plt.plot(epochs, history["recall"], label="recall")
+    plt.plot(epochs, history["f1"], label="f1")
+    plt.xlabel("Epoch")
+    plt.ylabel("Score")
+    plt.title("Presence Precision / Recall / F1")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(run_dir / "presence_precision_recall_f1.png")
+    plt.close()
+
     # Column accuracy
     plt.figure()
     plt.plot(epochs, history["column_exact"], label="column_exact")
+    plt.plot(epochs, history["column_tol1"], label="column_tol1")
     plt.plot(epochs, history["column_tol2"], label="column_tol2")
+    plt.plot(epochs, history["column_tol5"], label="column_tol5")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy")
     plt.title("Column Accuracy")
@@ -87,11 +130,34 @@ def save_training_plots(history, run_dir):
     plt.savefig(run_dir / "column_accuracy.png")
     plt.close()
 
-def create_run_dir(base_dir="./models"):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    run_dir = Path(base_dir) / f"model_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir
+    # Column MAE
+    plt.figure()
+    plt.plot(epochs, history["column_mae"], label="column_mae")
+    plt.xlabel("Epoch")
+    plt.ylabel("Mean Absolute Error")
+    plt.title("Column MAE")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(run_dir / "column_mae.png")
+    plt.close()
+
+
+def make_checkpoint(epoch, model, optimizer, history, extra=None):
+    checkpoint = {
+        "epoch": epoch + 1,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "history": history,
+        "target_height": TARGET_HEIGHT,
+        "target_width": TARGET_WIDTH,
+        "lambda_col": LAMBDA_COL,
+    }
+
+    if extra is not None:
+        checkpoint.update(extra)
+
+    return checkpoint
+
 
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
@@ -101,11 +167,11 @@ def train_one_epoch(model, loader, optimizer, device):
 
     for i, batch in enumerate(pbar):
         try:
-            x = batch["x"].to(device)
-            y_presence = batch["presence"].to(device)
-            y_column = batch["column"].to(device)
+            x = batch["x"].to(device, non_blocking=True)
+            y_presence = batch["presence"].to(device, non_blocking=True)
+            y_column = batch["column"].to(device, non_blocking=True)
         except Exception as e:
-            print(f"\n[ERROR] Failed while loading batch {i+1}/{len(loader)}: {e}")
+            print(f"\n[ERROR] Failed while loading batch {i + 1}/{len(loader)}: {e}")
             raise
 
         optimizer.zero_grad()
@@ -125,7 +191,7 @@ def train_one_epoch(model, loader, optimizer, device):
 
         total_loss += loss.item() * x.size(0)
 
-        pbar.set_postfix(loss=loss.item())
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     return total_loss / len(loader.dataset)
 
@@ -135,8 +201,13 @@ def validate(model, loader, device):
     model.eval()
 
     total_loss = 0.0
+
     correct_presence = 0
     total_presence = 0
+
+    tp = 0
+    fp = 0
+    fn = 0
 
     col_exact = 0
     col_tol1 = 0
@@ -146,9 +217,9 @@ def validate(model, loader, device):
     col_count = 0
 
     for batch in loader:
-        x = batch["x"].to(device)
-        y_presence = batch["presence"].to(device)
-        y_column = batch["column"].to(device)
+        x = batch["x"].to(device, non_blocking=True)
+        y_presence = batch["presence"].to(device, non_blocking=True)
+        y_column = batch["column"].to(device, non_blocking=True)
 
         presence_logit, column_logits = model(x)
 
@@ -157,15 +228,33 @@ def validate(model, loader, device):
             column_logits,
             y_presence,
             y_column,
-            lambda_col=LAMBDA_COL
+            lambda_col=LAMBDA_COL,
         )
+
         total_loss += loss.item() * x.size(0)
 
-        pred_presence = (torch.sigmoid(presence_logit) > 0.5).float()
+        # -------------------------
+        # Presence metrics
+        # -------------------------
+        presence_prob = torch.sigmoid(presence_logit)
+        pred_presence = (presence_prob > 0.5).float()
+
         correct_presence += (pred_presence == y_presence).sum().item()
         total_presence += y_presence.numel()
 
-        positive_mask = (y_presence == 1)
+        pred_presence_int = pred_presence.int()
+        y_presence_int = y_presence.int()
+
+        tp += ((pred_presence_int == 1) & (y_presence_int == 1)).sum().item()
+        fp += ((pred_presence_int == 1) & (y_presence_int == 0)).sum().item()
+        fn += ((pred_presence_int == 0) & (y_presence_int == 1)).sum().item()
+
+        # -------------------------
+        # Column metrics
+        # Only for positive samples
+        # -------------------------
+        positive_mask = y_presence == 1
+
         if positive_mask.any():
             pred_column = column_logits[positive_mask].argmax(dim=1)
             true_column = y_column[positive_mask]
@@ -179,23 +268,37 @@ def validate(model, loader, device):
             col_abs_error += abs_error.sum().item()
             col_count += true_column.numel()
 
-    # print(f"Validation samples counted: {total_presence}")
-    # print(f"Validation positive column samples counted: {col_count}")
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    if (precision + recall) > 0:
+        f1 = 2 * precision * recall / (precision + recall)
+    else:
+        f1 = 0.0
 
     return {
-    "loss": total_loss / len(loader.dataset),
-    "presence_acc": correct_presence / total_presence if total_presence else 0.0,
-    "column_exact": col_exact / col_count if col_count else 0.0,
-    "column_tol1": col_tol1 / col_count if col_count else 0.0,
-    "column_tol2": col_tol2 / col_count if col_count else 0.0,
-    "column_tol5": col_tol5 / col_count if col_count else 0.0,
-    "column_mae": col_abs_error / col_count if col_count else 0.0,
+        "loss": total_loss / len(loader.dataset),
+        "presence_acc": correct_presence / total_presence if total_presence else 0.0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "column_exact": col_exact / col_count if col_count else 0.0,
+        "column_tol1": col_tol1 / col_count if col_count else 0.0,
+        "column_tol2": col_tol2 / col_count if col_count else 0.0,
+        "column_tol5": col_tol5 / col_count if col_count else 0.0,
+        "column_mae": col_abs_error / col_count if col_count else 0.0,
+        "validation_samples": total_presence,
+        "validation_positive_samples": col_count,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
     }
 
 
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {torch.device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
@@ -212,20 +315,16 @@ def main():
         "TRAIN_DEMON_DIR": TRAIN_DEMON_DIR,
         "TEST_DEMON_DIR": TEST_DEMON_DIR,
         "LAMBDA_COL": LAMBDA_COL,
-    }
-    config["COMBINED_SCORE_FORMULA"] = "presence_acc + 0.5 * column_tol2"
-    config.update({
-        "BLOCK_LEN": 1.0,
-        "FPASS": 100,
-        "FSTOP": 1500,
-        "FPASS_DEMON": 300,
-    })
-
-    config.update({
+        "COMBINED_SCORE_FORMULA": COMBINED_SCORE_FORMULA,
+        "BLOCK_LEN": BLOCK_LEN,
+        "FPASS": FPASS,
+        "FSTOP": FSTOP,
+        "FPASS_DEMON": FPASS_DEMON,
+        "NORMALIZE": True,
         "DEVICE": str(device),
         "GPU": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
         "TORCH_VERSION": torch.__version__,
-    })
+    }
 
     train_dataset = VesselDataset(
         data_dir=TRAIN_DIR,
@@ -245,7 +344,6 @@ def main():
         normalize=True,
     )
 
-    print(f"Device: {device}")
     print(f"Train samples: {len(train_dataset)}")
     print(f"Test samples: {len(val_dataset)}")
     print(f"Fixed matrix size: ({TARGET_HEIGHT}, {TARGET_WIDTH})")
@@ -255,6 +353,7 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
     )
 
     val_loader = DataLoader(
@@ -262,11 +361,11 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
     )
 
     model = VesselNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    best_acc = 0.0
 
     run_dir = create_run_dir("./models")
     print(f"Saving this run to: {run_dir}")
@@ -276,6 +375,9 @@ def main():
         "train_loss": [],
         "val_loss": [],
         "presence_acc": [],
+        "precision": [],
+        "recall": [],
+        "f1": [],
         "column_exact": [],
         "column_tol1": [],
         "column_tol2": [],
@@ -286,22 +388,26 @@ def main():
     best_val_loss = float("inf")
     best_presence_acc = 0.0
     best_column_tol2 = 0.0
+    best_f1 = 0.0
     best_combined_score = 0.0
-    
+
     for epoch in range(NUM_EPOCHS):
         print(f"\n===== Epoch {epoch + 1}/{NUM_EPOCHS} =====", flush=True)
 
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_metrics = validate(model, val_loader, device)
 
-        combined_score = (val_metrics["presence_acc"]+ 0.5 * val_metrics["column_tol2"])
+        combined_score = val_metrics["f1"] + 0.5 * val_metrics["column_tol2"]
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
         history["presence_acc"].append(val_metrics["presence_acc"])
+        history["precision"].append(val_metrics["precision"])
+        history["recall"].append(val_metrics["recall"])
+        history["f1"].append(val_metrics["f1"])
         history["column_exact"].append(val_metrics["column_exact"])
-        history["column_tol2"].append(val_metrics["column_tol2"])
         history["column_tol1"].append(val_metrics["column_tol1"])
+        history["column_tol2"].append(val_metrics["column_tol2"])
         history["column_tol5"].append(val_metrics["column_tol5"])
         history["column_mae"].append(val_metrics["column_mae"])
 
@@ -310,6 +416,9 @@ def main():
             f"train_loss={train_loss:.4f} | "
             f"val_loss={val_metrics['loss']:.4f} | "
             f"presence_acc={val_metrics['presence_acc']:.4f} | "
+            f"precision={val_metrics['precision']:.4f} | "
+            f"recall={val_metrics['recall']:.4f} | "
+            f"f1={val_metrics['f1']:.4f} | "
             f"col_exact={val_metrics['column_exact']:.4f} | "
             f"col_tol1={val_metrics['column_tol1']:.4f} | "
             f"col_tol2={val_metrics['column_tol2']:.4f} | "
@@ -318,96 +427,145 @@ def main():
             flush=True,
         )
 
-        # save latest model
+        print(
+            f"Validation counted: "
+            f"samples={val_metrics['validation_samples']} | "
+            f"positives={val_metrics['validation_positive_samples']} | "
+            f"TP={val_metrics['tp']} | FP={val_metrics['fp']} | FN={val_metrics['fn']}",
+            flush=True,
+        )
+
+        # Save latest model
         torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "history": history,
-                "target_height": TARGET_HEIGHT,
-                "target_width": TARGET_WIDTH,
-            },
+            make_checkpoint(
+                epoch,
+                model,
+                optimizer,
+                history,
+                extra={
+                    "type": "last_model",
+                    "val_metrics": val_metrics,
+                    "combined_score": combined_score,
+                },
+            ),
             run_dir / "last_model.pth",
         )
 
-        # save best model by validation loss
+        # Save best model by validation loss
         if val_metrics["loss"] < best_val_loss:
             best_val_loss = val_metrics["loss"]
 
             torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "history": history,
-                    "target_height": TARGET_HEIGHT,
-                    "target_width": TARGET_WIDTH,
-                    "best_val_loss": best_val_loss,
-                },
+                make_checkpoint(
+                    epoch,
+                    model,
+                    optimizer,
+                    history,
+                    extra={
+                        "type": "best_val_loss",
+                        "metric": best_val_loss,
+                        "val_metrics": val_metrics,
+                        "combined_score": combined_score,
+                    },
+                ),
                 run_dir / "best_val_loss_model.pth",
             )
 
-            print("Saved best model!", flush=True)
+            print("Saved best_val_loss_model!", flush=True)
 
-        # Save best presence model
+        # Save best presence accuracy model
         if val_metrics["presence_acc"] > best_presence_acc:
             best_presence_acc = val_metrics["presence_acc"]
 
             torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "metric": best_presence_acc,
-                    "type": "best_presence_acc",
-                },
+                make_checkpoint(
+                    epoch,
+                    model,
+                    optimizer,
+                    history,
+                    extra={
+                        "type": "best_presence_acc",
+                        "metric": best_presence_acc,
+                        "val_metrics": val_metrics,
+                        "combined_score": combined_score,
+                    },
+                ),
                 run_dir / "best_presence_acc.pth",
             )
 
             print("Saved best_presence_acc model!", flush=True)
 
+        # Save best F1 model
+        if val_metrics["f1"] > best_f1:
+            best_f1 = val_metrics["f1"]
+
+            torch.save(
+                make_checkpoint(
+                    epoch,
+                    model,
+                    optimizer,
+                    history,
+                    extra={
+                        "type": "best_f1",
+                        "metric": best_f1,
+                        "val_metrics": val_metrics,
+                        "combined_score": combined_score,
+                    },
+                ),
+                run_dir / "best_f1.pth",
+            )
+
+            print("Saved best_f1 model!", flush=True)
 
         # Save best column_tol2 model
         if val_metrics["column_tol2"] > best_column_tol2:
             best_column_tol2 = val_metrics["column_tol2"]
 
             torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "metric": best_column_tol2,
-                    "type": "best_column_tol2",
-                },
+                make_checkpoint(
+                    epoch,
+                    model,
+                    optimizer,
+                    history,
+                    extra={
+                        "type": "best_column_tol2",
+                        "metric": best_column_tol2,
+                        "val_metrics": val_metrics,
+                        "combined_score": combined_score,
+                    },
+                ),
                 run_dir / "best_column_tol2.pth",
             )
 
             print("Saved best_column_tol2 model!", flush=True)
-
 
         # Save best combined model
         if combined_score > best_combined_score:
             best_combined_score = combined_score
 
             torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "metric": best_combined_score,
-                    "type": "best_combined",
-                },
+                make_checkpoint(
+                    epoch,
+                    model,
+                    optimizer,
+                    history,
+                    extra={
+                        "type": "best_combined",
+                        "metric": best_combined_score,
+                        "val_metrics": val_metrics,
+                        "combined_score": combined_score,
+                    },
+                ),
                 run_dir / "best_combined.pth",
             )
 
             print("Saved best_combined model!", flush=True)
 
-        # save metrics JSON
+        # Save metrics JSON
         with open(run_dir / "history.json", "w") as f:
             json.dump(history, f, indent=4)
 
-        # save plots every epoch
+        # Save plots every epoch
         save_training_plots(history, run_dir)
 
 
