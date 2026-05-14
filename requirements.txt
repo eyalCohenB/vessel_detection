@@ -4,4 +4,6 @@ torch
 matplotlib
 scipy
 tqdm
-
+onnx
+onnxscript
+onnxruntime
