@@ -159,14 +159,15 @@ def buildDemonMat(sig, fs, BlockLen, fpass, fstop, fpassDemon):
 
 
 def main():
+    base_path = '../data/talmon_data'
     data_type = ["train", "test"]
 
     for dt in data_type:
         print(f"Processing {dt} data...")
-        files =os.listdir(f"../data/{dt}_data")
+        files =os.listdir(f"{base_path}/{dt}_data")
         files = [f for f in files if f.endswith(".wav") or f.endswith(".flac")]
 
-        skip_files = os.listdir(f"../data/{dt}_demon_mats")
+        skip_files = os.listdir(f"{base_path}/{dt}_demon")
         # shuffle files and pick the first 10 to test
         # np.random.shuffle(files)
         # files = files[:10]
@@ -177,7 +178,7 @@ def main():
                 print(f"Skipping {files[i]} as it has already been processed.")
                 continue
             print(f"\nProcessing file {i+1}/{len(files)}: {files[i]}")
-            data, fs = sf.read(f"../data/{dt}_data/{files[i]}")
+            data, fs = sf.read(f"{base_path}/{dt}_data/{files[i]}")
             sig = data[:, 0] if data.ndim > 1 else data
 
             DemonMat, SNRVec = buildDemonMat(sig=sig,fs=fs,BlockLen=1,fpass=100,fstop=1500,fpassDemon=300)
@@ -190,11 +191,11 @@ def main():
             
             # save DemonMat and SNRVec to a pickle file for later inspection
             demon_file_name = os.path.splitext(files[i])[0] + ".pkl"
-            print(f"Saving DemonMat and SNRVec to ../data/{dt}_demon_mats/{demon_file_name}")
-            with open(f"../data/{dt}_demon_mats/{demon_file_name}", "wb") as f:
+            print(f"Saving DemonMat and SNRVec to {base_path}/{dt}_demon/{demon_file_name}")
+            with open(f"{base_path}/{dt}_demon/{demon_file_name}", "wb") as f:
                 pickle.dump({"DemonMat": DemonMat, "SNRVec": SNRVec}, f)
 
-        # plot_demon_matrix(DemonMat)
+            # plot_demon_matrix(DemonMat)
 
     
 if __name__ == "__main__":

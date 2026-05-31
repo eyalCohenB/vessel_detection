@@ -1,10 +1,9 @@
 __pycache__/
-data/test_data/*.flac
-data/test_data/*.txt
-data/train_data/*.flac
-data/train_data/*.txt
-data/train_demon_mats/*.pkl
-data/test_demon_mats/*.pkl
-data/boat_data_eilat2021_startEndTimes.mat
+data/eilat_data/*
+data/talmon_data/*
+data/eilat_data/boat_data_eilat2021_startEndTimes.mat
 helper_funcs/__pycache__/
 models/model*
+helper_funcs/inference_output_test-data.txt
+helper_funcs/inference_output_train-data.txt
+helper_funcs/plotWav.py
